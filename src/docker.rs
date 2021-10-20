@@ -26,10 +26,17 @@ use crate::datetime::{datetime_from_nano_timestamp, datetime_from_unix_timestamp
 #[cfg(feature = "chrono")]
 use chrono::{DateTime, Utc};
 
-#[cfg(feature = "tls")]
-use hyper_openssl::HttpsConnector;
-#[cfg(feature = "tls")]
-use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
+use hyper_rustls::HttpsConnector;
+use tokio_rustls::rustls::{
+    internal::pemfile,
+    sign::{CertifiedKey, RSASigningKey},
+    Certificate, ClientConfig, PrivateKey, ResolvesClientCert, SignatureScheme,
+};
+use std::sync::Arc;
+use std::path::PathBuf;
+use std::fs;
+
+use log::warn;
 
 #[cfg(feature = "unix-socket")]
 use hyperlocal::UnixConnector;
@@ -40,70 +47,183 @@ pub struct Docker {
     transport: Transport,
 }
 
-fn get_http_connector() -> HttpConnector {
-    let mut http = HttpConnector::new();
-    http.enforce_http(false);
+fn get_docker_for_tcp(tcp_host_str: String) -> std::result::Result<Docker, Box<dyn std::error::Error + Send + Sync>> {
+    if !tcp_host_str.starts_with("http://") {
+        // Set up HTTP.
+        let mut http = HttpConnector::new();
+        http.enforce_http(false);
 
-    http
-}
+        // Set up SSL parameters.
+        let mut config = ClientConfig::new();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.ct_logs = Some(&ct_logs::LOGS);
 
-#[cfg(feature = "tls")]
-fn get_docker_for_tcp(tcp_host_str: String) -> Docker {
-    let http = get_http_connector();
-    if let Ok(ref certs) = env::var("DOCKER_CERT_PATH") {
-        // fixme: don't unwrap before you know what's in the box
-        // https://github.com/hyperium/hyper/blob/master/src/net.rs#L427-L428
-        let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
-        connector.set_cipher_list("DEFAULT").unwrap();
-        let cert = &format!("{}/cert.pem", certs);
-        let key = &format!("{}/key.pem", certs);
-        connector
-            .set_certificate_file(&Path::new(cert), SslFiletype::PEM)
-            .unwrap();
-        connector
-            .set_private_key_file(&Path::new(key), SslFiletype::PEM)
-            .unwrap();
-        if env::var("DOCKER_TLS_VERIFY").is_ok() {
-            let ca = &format!("{}/ca.pem", certs);
-            connector.set_ca_file(&Path::new(ca)).unwrap();
+        // Look up any certs managed by the operating system.
+        config.root_store = match rustls_native_certs::load_native_certs() {
+            Ok(store) => store,
+            Err((Some(store), err)) => {
+                warn!("could not load all certificates: {}", err);
+                store
+            }
+            Err((None, err)) => {
+                warn!("cannot access native certificate store: {}", err);
+                config.root_store
+            }
+        };
+
+        // Add any webpki certs, too, in case the OS is useless.
+        config
+            .root_store
+            .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+
+        // Install our Docker CA if we have one.
+        if should_enable_tls() {
+            let ca_path = docker_ca_pem_path()?;
+            let mut rdr = open_buffered(&ca_path)?;
+            config
+                .root_store
+                .add_pem_file(&mut rdr)
+                .map_err(|_| format!("error reading {}", ca_path.display()))?;
         }
+
+        // Install a client certificate resolver to find our client cert (if we need one).
+        config.client_auth_cert_resolver = Arc::new(DockerClientCertResolver);
 
         // If we are attempting to connec to the docker daemon via tcp
         // we need to convert the scheme to `https` to let hyper connect.
         // Otherwise, hyper will reject the connection since it does not
         // recongnize `tcp` as a valid `http` scheme.
-        let tcp_host_str = if tcp_host_str.contains("tcp://") {
+        let tcp_host_str = if tcp_host_str.starts_with("tcp://") {
             tcp_host_str.replace("tcp://", "https://")
         } else {
             tcp_host_str
         };
 
-        Docker {
+        Ok(Docker {
             transport: Transport::EncryptedTcp {
                 client: Client::builder()
-                    .build(HttpsConnector::with_connector(http, connector).unwrap()),
+                    .build(HttpsConnector::from((http, config))),
                 host: tcp_host_str,
             },
-        }
+        })
     } else {
-        Docker {
+        let mut http = HttpConnector::new();
+        http.enforce_http(false);
+
+        Ok(Docker {
             transport: Transport::Tcp {
                 client: Client::builder().build(http),
                 host: tcp_host_str,
             },
-        }
+        })
     }
 }
 
-#[cfg(not(feature = "tls"))]
-fn get_docker_for_tcp(tcp_host_str: String) -> Docker {
-    let http = get_http_connector();
-    Docker {
-        transport: Transport::Tcp {
-            client: Client::builder().build(http),
-            host: tcp_host_str,
-        },
+/// A client certificate resolver that looks up Docker client certs the same way
+/// the official CLI tools do.
+struct DockerClientCertResolver;
+
+impl ResolvesClientCert for DockerClientCertResolver {
+    fn resolve(
+        &self,
+        _acceptable_issuers: &[&[u8]],
+        _sigschemes: &[SignatureScheme],
+    ) -> Option<CertifiedKey> {
+        if self.has_certs() {
+            match docker_client_key() {
+                Ok(key) => Some(key),
+                Err(err) => {
+                    warn!("error reading Docker client keys: {}", err);
+                    None
+                }
+            }
+        } else {
+            None
+        }
     }
+
+    fn has_certs(&self) -> bool {
+        should_enable_tls()
+    }
+}
+
+fn should_enable_tls() -> bool {
+    env::var("DOCKER_TLS_VERIFY").is_ok()
+}
+
+/// The default directory in which to look for our Docker certificate files.
+fn default_cert_path() -> std::result::Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let from_env = env::var("DOCKER_CERT_PATH").or_else(|_| env::var("DOCKER_CONFIG"));
+    if let Ok(ref path) = from_env {
+        Ok(Path::new(path).to_owned())
+    } else {
+        let home = dirs::home_dir().ok_or_else(|| "no cert path")?;
+        Ok(home.join(".docker"))
+    }
+}
+
+/// Path to `ca.pem`.
+fn docker_ca_pem_path() -> std::result::Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let dir = default_cert_path()?;
+    Ok(dir.join("ca.pem"))
+}
+
+/// Our Docker client credentials, if we have them.
+fn docker_client_key() -> std::result::Result<CertifiedKey, Box<dyn std::error::Error + Send + Sync>> {
+    let dir = default_cert_path()?;
+
+    // Look up our certificates.
+    let mut all_certs = certs(&dir.join("cert.pem"))?;
+    all_certs.extend(certs(&dir.join("ca.pem"))?.into_iter());
+
+    // Look up our keys.
+    let key_path = dir.join("key.pem");
+    let mut all_keys = keys(&key_path)?;
+    let key = if all_keys.len() == 1 {
+        all_keys.remove(0)
+    } else {
+        return Err(format!(
+            "expected 1 private key in {}, found {}",
+            key_path.display(),
+            all_keys.len()
+        )
+        .into());
+    };
+    let signing_key = RSASigningKey::new(&key)
+        .map_err(|_| format!("could not parse signing key from {}", key_path.display()))?;
+
+    Ok(CertifiedKey::new(
+        all_certs,
+        Arc::new(Box::new(signing_key)),
+    ))
+}
+
+/// Fetch any certificates stored at `path`.
+fn certs(path: &Path) -> std::result::Result<Vec<Certificate>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut rdr = open_buffered(path)?;
+    Ok(pemfile::certs(&mut rdr).map_err(|_| format!("cannot read {}", path.display()))?)
+}
+
+/// Fetch any keys stored at `path`.
+fn keys(path: &Path) -> std::result::Result<Vec<PrivateKey>, Box<dyn std::error::Error + Send + Sync>> {
+    // Look for pcks8 keys.
+    let mut rdr = open_buffered(path)?;
+    let mut keys = pemfile::pkcs8_private_keys(&mut rdr)
+        .map_err(|_| format!("cannot read {}", path.display()))?;
+
+    // Re-open and look for RSA keys.
+    rdr = open_buffered(path)?;
+    keys.extend(
+        pemfile::rsa_private_keys(&mut rdr)
+            .map_err(|_| format!("cannot read {}", path.display()))?,
+    );
+    Ok(keys)
+}
+
+/// Open a path and return a buffered reader.
+fn open_buffered(path: &Path) -> std::result::Result<io::BufReader<fs::File>, Box<dyn std::error::Error + Send + Sync>> {
+    let f = fs::File::open(path).map_err(|_| format!("cannot open {}", path.display()))?;
+    Ok(io::BufReader::new(f))
 }
 
 // https://docs.docker.com/reference/api/docker_remote_api_v1.17/
@@ -165,7 +285,7 @@ impl Docker {
             #[cfg(not(feature = "unix-socket"))]
             Some("unix") => panic!("Unix socket support is disabled"),
 
-            _ => get_docker_for_tcp(tcp_host_str),
+            _ => get_docker_for_tcp(tcp_host_str).unwrap(),
         }
     }
 

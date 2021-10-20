@@ -11,8 +11,7 @@ use hyper::{
     client::{Client, HttpConnector},
     header, Body, Method, Request, StatusCode,
 };
-#[cfg(feature = "tls")]
-use hyper_openssl::HttpsConnector;
+use hyper_rustls::HttpsConnector;
 #[cfg(feature = "unix-socket")]
 use hyperlocal::UnixConnector;
 #[cfg(feature = "unix-socket")]
@@ -43,7 +42,6 @@ pub enum Transport {
         host: String,
     },
     /// TCP/TLS
-    #[cfg(feature = "tls")]
     EncryptedTcp {
         client: Client<HttpsConnector<HttpConnector>>,
         host: String,
@@ -63,7 +61,6 @@ impl fmt::Debug for Transport {
     ) -> fmt::Result {
         match *self {
             Transport::Tcp { ref host, .. } => write!(f, "Tcp({})", host),
-            #[cfg(feature = "tls")]
             Transport::EncryptedTcp { ref host, .. } => write!(f, "EncryptedTcp({})", host),
             #[cfg(feature = "unix-socket")]
             Transport::Unix { ref path, .. } => write!(f, "Unix({})", path),
@@ -183,7 +180,6 @@ impl Transport {
                     .method(method)
                     .uri(&format!("{}{}", host, endpoint.as_ref()))
             }
-            #[cfg(feature = "tls")]
             Transport::EncryptedTcp { ref host, .. } => {
                 builder
                     .method(method)
@@ -218,7 +214,6 @@ impl Transport {
     ) -> Result<hyper::Response<Body>> {
         match self {
             Transport::Tcp { ref client, .. } => Ok(client.request(req).await?),
-            #[cfg(feature = "tls")]
             Transport::EncryptedTcp { ref client, .. } => Ok(client.request(req).await?),
             #[cfg(feature = "unix-socket")]
             Transport::Unix { ref client, .. } => Ok(client.request(req).await?),
