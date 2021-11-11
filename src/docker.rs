@@ -48,7 +48,7 @@ pub struct Docker {
 }
 
 fn get_docker_for_tcp(tcp_host_str: String) -> std::result::Result<Docker, Box<dyn std::error::Error + Send + Sync>> {
-    if !tcp_host_str.starts_with("http://") {
+    if tcp_host_str.starts_with("https://") || should_enable_tls() {
         // Set up HTTP.
         let mut http = HttpConnector::new();
         http.enforce_http(false);
