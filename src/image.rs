@@ -2,7 +2,7 @@
 //!
 //! API Reference: <https://docs.docker.com/engine/api/v1.41/#tag/Image>
 
-use std::{collections::HashMap, io::Read, iter};
+use std::{collections::HashMap, iter};
 
 use futures_util::{stream::Stream, TryFutureExt, TryStreamExt};
 use hyper::Body;
@@ -225,20 +225,16 @@ impl<'docker> Images<'docker> {
     /// [Api Reference](https://docs.docker.com/engine/api/v1.41/#operation/ImageLoad)
     pub fn import<R>(
         self,
-        mut tarball: R,
+        tarball: R,
     ) -> impl Stream<Item = Result<ImageBuildChunk>> + Unpin + 'docker
     where
-        R: Read + Send + 'docker,
+        R: Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static,
     {
         Box::pin(
             async move {
-                let mut bytes = Vec::default();
-
-                tarball.read_to_end(&mut bytes)?;
-
                 let value_stream = self.docker.stream_post_into(
                     "/images/load",
-                    Some((Body::from(bytes), tar())),
+                    Some((Body::wrap_stream(tarball), tar())),
                     None::<iter::Empty<_>>,
                 );
                 Ok(value_stream)
